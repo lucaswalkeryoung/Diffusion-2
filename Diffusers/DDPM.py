@@ -1,161 +1,243 @@
 # --------------------------------------------------------------------------------------------------
-# ----------------------------------- Diffusion :: DDPM Diffuser -----------------------------------
+# ----------------------------------- DIFFUSERS :: DDPM Diffuser -----------------------------------
 # --------------------------------------------------------------------------------------------------
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts as CAWRScheduler
-
 import torchvision.transforms as transforms
-import torch.optim as optimizers
+import torch.optim.lr_scheduler as scheduling
+import torch.optim as optimizing
 import torch.nn as networks
 import torch
-
-import uuid
+import os
 import math
-import random
+import shutil
 
-from Modules.UNet import UNet
+from . Diffuser import Diffuser
+
+from PIL import Image
 
 
 # --------------------------------------------------------------------------------------------------
 # ------------------------------------- CLASS :: DDPM Diffuser -------------------------------------
 # --------------------------------------------------------------------------------------------------
-class DDPM(object):
+class DDPM(Diffuser):
 
-    def __init__(self, **parameters: int | float) -> None:
+    # ------------------------------------------------------------------------------------------
+    # -------------------------------- ATTRIBUTES :: Attributes --------------------------------
+    # ------------------------------------------------------------------------------------------
+    transforms_forward : transforms.Compose
+    transforms_reverse : transforms.Compose
+
+    scheduler : scheduling.LRScheduler
+    optimizer : optimizing.Optimizer
+    unet      : networks.Module
+    device    : torch.device
+
+    resolution : int   # maximum image resolution
+    timesteps  : int   # maximum denoising steps
+    max_beta   : float # maximum noise
+    min_beta   : float # minimum noise
+    max_lr     : float
+    min_lr     : float
+    t_channels : int   # t-embedding dimension
+    s_channels : int   # s-embedding dimension (spatial embedding)
+    scales     : int   # number of distinct resolutions
+    epochs     : int
+    restarts   : int
+    batch_size : int
+
+    t: torch.Tensor # precomputed temporal embeddings
+    s: torch.Tensor # precomputed spatial embeddings
+    a: torch.Tensor # alpha schedule
+    b: torch.Tensor # beta schedule
+    ā: torch.Tensor # cumulative alpha schedule
+    b̄: torch.Tensor # cumulative beta schedule
+    ã̄: torch.Tensor # square-root of ā
+    ã: torch.Tensor # square-root of a
+    b̃̄: torch.Tensor # square-root of b̄
+    b̃: torch.Tensor # square-root of b
+
+
+    # ------------------------------------------------------------------------------------------
+    # ------------------------------- CONSTRUCTOR :: Constructor -------------------------------
+    # ------------------------------------------------------------------------------------------
+    def __init__(self, **hyperparameters: int | float) -> None:
+        super().__init__()
+
+        self.resolution = hyperparameters.get("resolution",  256)
+        self.timesteps  = hyperparameters.get("timesteps",   100)
+        self.max_lr     = hyperparameters.get("max_lr",     1e-2)
+        self.min_lr     = hyperparameters.get("min_lr",     1e-5)
+        self.max_beta   = hyperparameters.get("max_beta",   2e-2)
+        self.min_beta   = hyperparameters.get("min_beta",   1e-4)
+        self.t_channels = hyperparameters.get("t_channels",   32)
+        self.s_channels = hyperparameters.get("s_channels",   32)
+        self.scales     = hyperparameters.get("scales",        4)
+        self.epochs     = hyperparameters.get("epochs",      128)
+        self.restarts   = hyperparameters.get("restarts",      8)
+        self.batch_size = hyperparameters.get("batch_size",    8)
+
+        self.optimizer = None
+        self.scheduler = None
+        self.unet = None
+        self.device = None
+
+        self.t = None
+        self.s = None
+        self.a = None
+        self.b = None
+        self.ā = None
+        self.b̄ = None
+        self.ã̄ = None
+        self.ã = None
+        self.b̃̄ = None
+        self.b̃ = None
+
+        self.configure_transforms()
+        self.configure_components()
+        self.configure_scheduling()
+        self.configure_embeddings()
+
+
+    # ------------------------------------------------------------------------------------------
+    # -------------------- CONFIGURATION :: Configure Child Components, Etc --------------------
+    # ------------------------------------------------------------------------------------------
+    def configure_components(self) -> None:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
-        # tensor-to-image procedure
-        self.transform = transforms.Compose([
+
+    # ------------------------------------------------------------------------------------------
+    # ------------- CONFIGURATION :: Configure Forward and Reverse Transformations -------------
+    # ------------------------------------------------------------------------------------------
+    def configure_transforms(self) -> None:
+
+        BILINEAR = transforms.InterpolationMode.BILINEAR
+
+        # forward transforms - spatial and color transforms, to tensor, and normalize
+        self.transforms_forward = transforms.Compose([
+            transforms.RandomAffine(
+                degrees=(-15, 15),  # Rotation between -15 to +15 degrees
+                translate=(0.10, 0.10),  # Translation up to 10% horizontally and vertically
+                scale=(0.90, 1.10),  # Scaling between 90% to 110%
+                fill=0xFFFFFF,
+                interpolation=BILINEAR  # Use bilinear interpolation
+            ),
+            transforms.ColorJitter(
+                brightness=0.10, # ±10% brightness
+                contrast=0.10, # ±10% contrast
+                saturation=0.10, # ±10% saturation
+                hue=0.10 # ±10% hue
+            ),
+            transforms.RandomHorizontalFlip(),
+            transforms.Resize(256, interpolation=BILINEAR),
+            transforms.RandomCrop(256),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+
+        # reverse transforms - from tensor and denormalize
+        self.transforms_reverse = transforms.Compose([
             transforms.Normalize((-1.0, -1.0, -1.0), (2.0, 2.0, 2.0)),
             transforms.ToPILImage(),
         ])
 
-        self.timesteps  : int   = parameters.get('timesteps', 1000) # total denoising steps
-        self.resolution : int   = parameters.get('resolution', 256) # maximum image resolution
-        self.max_beta   : float = parameters.get('max_beta',  2e-2) # minimum noise
-        self.min_beta   : float = parameters.get('min_beta',  1e-4) # maximum noise
-        self.max_lr     : float = parameters.get('max_lr',    5e-2)
-        self.min_lr     : float = parameters.get('min_lr',    5e-3)
-        self.t_channels : int   = parameters.get('t_channels',  32) # timestep embedding dimension
-        self.s_channels : int   = parameters.get('s_channels',  32) # position embedding dimension
-        self.cycles     : int   = parameters.get('cycles',      32) # epochs before restart
+    # ------------------------------------------------------------------------------------------
+    # ----------------------- CONFIGURATION :: Configure Noise Injection -----------------------
+    # ------------------------------------------------------------------------------------------
+    def configure_scheduling(self, ε: float = 0, π: float = torch.pi) -> None:
 
-        # initialize the unet
-        self.unet = UNet(self.t_channels, self.s_channels)
-        self.unet = self.unet.to(self.device)
-        self.unet = self.unet.train()
+        # cumulative cosine signal-to-noise
+        ā = torch.linspace(ε, 1 + ε, self.timesteps + 1) / (1 + ε)
+        ā = torch.cos(ā * π * 0.50) ** 2
+        ā = ā / ā[0]
 
-        # initialize the optimizer and scheduler
-        self.optimizer = optimizers.Adam(self.unet.parameters(), lr=self.min_lr)
-        self.scheduler = CAWRScheduler(self.optimizer, T_0=self.cycles, eta_min=self.min_lr)
+        # stepwise signal-to-noise
+        a = torch.cat([torch.Tensor([1.00]), ā[1:] / ā[:-1]], dim=0)
 
-        # declare remaining tensor attributes
-        self.a : torch.Tensor
-        self.b : torch.Tensor
-        self.ā : torch.Tensor
-        self.b̄ : torch.Tensor
-        self.t : torch.Tensor
-        self.s : torch.Tensor
+        # cumulative and stepwise noise-to-signal
+        b = 1.00 - a
+        b̄ = 1.00 - ā
 
-        self.compute_embeddings()
-        self.compute_scheduling()
+        # square-roots of relevant tensors for cleanliness
+        ã̄ = torch.sqrt(ā)
+        ã = torch.sqrt(a)
+        b̃̄ = torch.sqrt(b̄)
+        b̃ = torch.sqrt(b)
 
-    def compute_embeddings(self) -> None:
+        self.a = a.to(self.device)
+        self.b = b.to(self.device)
+        self.ā = ā.to(self.device)
+        self.b̄ = b̄.to(self.device)
+        self.ã = ã.to(self.device)
+        self.ã̄ = ã̄.to(self.device)
+        self.b̃ = b̃.to(self.device)
+        self.b̃̄ = b̃̄.to(self.device)
 
-        # sinusoidal embedding along the height and width axes (used by
-        # the self-attention mechanisms)
-        ω = torch.linspace(math.log(1.0), math.log(10000.0), self.t_channels // 2).exp()
-        d = torch.linspace(0.00, math.pi * 2, self.resolution).unsqueeze(1)
-        sin = torch.sin(d * ω)
-        cos = torch.cos(d * ω)
+    # ------------------------------------------------------------------------------------------
+    # --------------- CONFIGURATION :: Configure Temporal and Spatial Embeddings ---------------
+    # ------------------------------------------------------------------------------------------
+    def configure_embeddings(self, π: float = torch.pi) -> None:
+
+        # sinusoidal frequencies for timestep embeddings (radians/unit-time)
+        ω = torch.linspace(math.log(1.0), math.log(10000.0), self.t_channels // 2)
+        ω = torch.exp(ω)
+
+        # mapping from timestep to percentage of maximum time
+        u = torch.linspace(0.00, 1.00, self.timesteps + 1).unsqueeze(1)
+
+        # precomputed sinusoidal timestep embeddings for all steps
+        sin = torch.sin(u * ω) # (θ * ω) is in radians
+        cos = torch.cos(u * ω) # (θ * ω) is in radians
+        t = torch.cat([sin, cos], dim=1)
+
+        # sinusoidal frequencies for spatial embeddings (radians/unit-displacement)
+        ω = torch.linspace(math.log(1.0), math.log(10000.0), self.s_channels // 2)
+        ω = torch.exp(ω)
+
+        # Precomputed sinusoidal spatial embedding
+        sin = torch.sin(u * ω)  # (u * ω) is in radians
+        cos = torch.cos(u * ω)  # (u * ω) is in radians
         s = torch.cat([sin, cos], dim=1)
         s = s.unsqueeze(1) + s.unsqueeze(0)
         s = s.swapaxes(0, 2)
 
-        # precomputed sinusoidal embedding along the time axis
-        ω = torch.linspace(math.log(1.0), math.log(10000.0), self.t_channels // 2).exp()
-        t = torch.linspace(0.00, math.pi * 2, self.timesteps + 1).unsqueeze(1)
-        sin = torch.sin(t * ω)
-        cos = torch.cos(t * ω)
-        t = torch.cat([sin, cos], dim=1)
+        # spatial and temporal embeddings, moved to the device
+        self.t = t.to(self.device)
+        self.s = s.to(self.device)
 
-        # store relevant tensors on CPU
-        self.t = t
-        self.s = s
+    # ------------------------------------------------------------------------------------------
+    # ------------------------ FORWARD :: The Forward Diffusion Process ------------------------
+    # ------------------------------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
 
-    def compute_scheduling(self) -> None:
+        ã̄ₜ = self.ã̄[self.timesteps] # signal-to-noise
+        b̃̄ₜ = self.ã̄[self.timesteps] # noise-to-signal
 
-        # a cosine-squared beta schedule from min_beta to max_beta
-        b = torch.linspace(0, torch.pi / 2.00, self.timesteps + 1)
-        b = torch.cos(b) ** 2
-        b = b * (self.max_beta - self.min_beta) + self.min_beta
+        # the first noise prediction as well as the noise injection
+        eₜ = torch.randn_like(x)
 
-        # alpha schedule
-        a = 1.00 - b
+        # the noisy image
+        xₜ = (x * ã̄ₜ) + (eₜ * b̃̄ₜ)
 
-        # cumulative alpha and beta schedules
-        ā = torch.cumprod(a, dim=0)
-        b̄ = 1.00 - ā
+        return x, xₜ, eₜ
 
-        # store relevant tensors on CPU
-        self.a = a
-        self.b = b
-        self.ā = ā
-        self.b̄ = b̄
+    # ------------------------------------------------------------------------------------------
+    # ------------------------ REVERSE :: The Reverse Diffusion Process ------------------------
+    # ------------------------------------------------------------------------------------------
+    def reverse(self, x0: torch.Tensor, xₜ: torch.Tensor, eₜ: torch.Tensor) -> torch.Tensor:
 
-    def forward(self, signal: torch.Tensor, t: int = 0) -> tuple[torch.Tensor, ...]:
+        # skip t = timesteps due to a quirk in the unet simulation logic
+        for t in reversed(range(1, self.timesteps)):
 
-        t = t or random.randint(1, self.timesteps)
+            ã̄ = self.ã̄[t]
+            ã = self.ã[t]
+            b = self.b[t]
+            b̃̄ = self.b̃̄[t]
 
-        t_embedding = self.t[t]
-        s_embedding = self.s
+            xₜ = (1 / ã) * (xₜ - (eₜ * (b / b̃̄))) # the denoised image
 
-        āₜ = self.ā[t]
-        b̄ₜ = self.b̄[t]
+            # simulate noise prediction by deriving it directly from the clean image
+            eₜ = (xₜ - (x0 * ã̄)) / b̃̄
 
-        signal = torch.sqrt(āₜ) * signal
-        noise  = torch.sqrt(b̄ₜ) * torch.randn_like(signal)
+            self.transforms_reverse(xₜ).save(f"Outputs/{t}_reversed.png")
 
-        return signal + noise, noise, t_embedding, s_embedding
-
-    def reverse(self, n: int = 1) -> None:
-
-        signal = torch.randn(n, 3, 256, 256).to(self.device)
-
-        self.unet.eval()
-        with torch.no_grad():
-            for t in reversed(range(1, self.timesteps + 1)):
-
-                t_embedding = self.t[t]
-                s_embedding = self.s
-
-                t_embedding = t_embedding.to(self.device)
-                s_embedding = s_embedding.to(self.device)
-
-                t_embedding = t_embedding.unsqueeze(0)
-                s_embedding = s_embedding.unsqueeze(0)
-
-                incoming = torch.randn_like(signal) if t != 1 else torch.zeros_like(signal)
-                outgoing = self.unet(signal, t_embedding, s_embedding)
-
-                bₜ = self.b[t]
-                b̄ₜ = self.b̄[t]
-                aₜ = self.a[t]
-
-                incoming = incoming * (torch.sqrt(bₜ))
-                outgoing = outgoing * (bₜ / torch.sqrt(b̄ₜ))
-
-                signal = signal - outgoing
-                signal = signal / torch.sqrt(aₜ)
-                signal = signal + incoming
-
-        self.unet.train()
-
-        self.transform(signal[0]).save(f"Outputs/{uuid.uuid4()}.jpg")
-
-    def learn(self, error: torch.Tensor) -> None:
-
-        error.backward()
-        self.optimizer.step()
-        self.scheduler.step()
-        self.optimizer.zero_grad()
+        return xₜ
