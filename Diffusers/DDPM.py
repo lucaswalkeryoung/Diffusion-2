@@ -1,16 +1,23 @@
 # --------------------------------------------------------------------------------------------------
 # ----------------------------------- DIFFUSERS :: DDPM Diffuser -----------------------------------
 # --------------------------------------------------------------------------------------------------
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts as CAWRScheduler
+
 import torchvision.transforms as transforms
 import torch.optim.lr_scheduler as scheduling
 import torch.optim as optimizing
 import torch.nn as networks
+
+import pathlib
+import random
 import torch
 import os
 import math
 import shutil
+import typing
 
-from . Diffuser import Diffuser
+from .  Diffuser import Diffuser
+from Modules.UNet import UNet
 
 from PIL import Image
 
@@ -30,19 +37,20 @@ class DDPM(Diffuser):
     optimizer : optimizing.Optimizer
     unet      : networks.Module
     device    : torch.device
+    paths     : list[str]
 
-    resolution : int   # maximum image resolution
-    timesteps  : int   # maximum denoising steps
-    max_beta   : float # maximum noise
-    min_beta   : float # minimum noise
-    max_lr     : float
-    min_lr     : float
-    t_channels : int   # t-embedding dimension
-    s_channels : int   # s-embedding dimension (spatial embedding)
-    scales     : int   # number of distinct resolutions
-    epochs     : int
-    restarts   : int
-    batch_size : int
+    resolution  : int   # maximum image resolution
+    timesteps   : int   # maximum denoising steps
+    max_beta    : float # maximum noise
+    min_beta    : float # minimum noise
+    max_lr      : float
+    min_lr      : float
+    t_channels  : int   # t-embedding dimension
+    s_channels  : int   # s-embedding dimension (spatial embedding)
+    epochs      : int
+    restarts    : int
+    batch_size  : int
+    dataset_len : int
 
     t: torch.Tensor # precomputed temporal embeddings
     s: torch.Tensor # precomputed spatial embeddings
@@ -55,6 +63,17 @@ class DDPM(Diffuser):
     b̃̄: torch.Tensor # square-root of b̄
     b̃: torch.Tensor # square-root of b
 
+    # ------------------------------------------------------------------------------------------
+    # ------------------- OPERATORS :: Sampler and Data-Loader Functionality -------------------
+    # ------------------------------------------------------------------------------------------
+    def __getitem__(self, path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(self.transforms_forward(Image.open(path)).to(self.device))
+
+    def __iter__(self) -> typing.Iterator[str]:
+        return iter(random.sample(self.paths, len(self.paths)))
+
+    def __len__(self) -> int:
+        return len(self.paths)
 
     # ------------------------------------------------------------------------------------------
     # ------------------------------- CONSTRUCTOR :: Constructor -------------------------------
@@ -62,18 +81,18 @@ class DDPM(Diffuser):
     def __init__(self, **hyperparameters: int | float) -> None:
         super().__init__()
 
-        self.resolution = hyperparameters.get("resolution",  256)
-        self.timesteps  = hyperparameters.get("timesteps",   100)
-        self.max_lr     = hyperparameters.get("max_lr",     1e-2)
-        self.min_lr     = hyperparameters.get("min_lr",     1e-5)
-        self.max_beta   = hyperparameters.get("max_beta",   2e-2)
-        self.min_beta   = hyperparameters.get("min_beta",   1e-4)
-        self.t_channels = hyperparameters.get("t_channels",   32)
-        self.s_channels = hyperparameters.get("s_channels",   32)
-        self.scales     = hyperparameters.get("scales",        4)
-        self.epochs     = hyperparameters.get("epochs",      128)
-        self.restarts   = hyperparameters.get("restarts",      8)
-        self.batch_size = hyperparameters.get("batch_size",    8)
+        self.resolution  = hyperparameters.get("resolution",  256) # max resolution
+        self.timesteps   = hyperparameters.get("timesteps",  1000) # max timesteps
+        self.max_lr      = hyperparameters.get("max_lr",     1e-2)
+        self.min_lr      = hyperparameters.get("min_lr",     1e-5)
+        self.max_beta    = hyperparameters.get("max_beta",   2e-2) # vestigial
+        self.min_beta    = hyperparameters.get("min_beta",   1e-4) # vestigial
+        self.t_channels  = hyperparameters.get("t_channels",   32) # timestep embed dimension
+        self.s_channels  = hyperparameters.get("s_channels",   32) # position embed dimension
+        self.epochs      = hyperparameters.get("epochs",      128)
+        self.restarts    = hyperparameters.get("restarts",      8) # number of lr-restarts
+        self.batch_size  = hyperparameters.get("batch_size",    8)
+        self.dataset_len = hyperparameters.get("dataset_len",   0) # mandatory
 
         self.optimizer = None
         self.scheduler = None
@@ -102,7 +121,26 @@ class DDPM(Diffuser):
     # ------------------------------------------------------------------------------------------
     def configure_components(self) -> None:
 
+        # cuda if possible else mps (apple silicon)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+
+        # paths of all images in the dataset
+        self.paths = list(pathlib.Path('Dataset').glob("*.JPG"))
+
+        # the unet
+        self.unet = UNet(self.t_channels, self.s_channels)
+        self.unet = self.unet.to(self.device)
+
+        # the unet's optimizer
+        self.optimizer = optimizing.Adam(self.unet.parameters(), lr=self.max_lr)
+
+        # number of batches until lr-restart
+        batches_per_epoch = math.ceil(len(self.paths) / self.batch_size)
+        epochs_per_restart = self.epochs / self.restarts
+        T_0 = epochs_per_restart * batches_per_epoch
+
+        # cosine-annealing-warm-restarts scheduler
+        self.scheduler = CAWRScheduler(self.optimizer, T_0=50, eta_min=0)
 
 
     # ------------------------------------------------------------------------------------------
@@ -114,20 +152,21 @@ class DDPM(Diffuser):
 
         # forward transforms - spatial and color transforms, to tensor, and normalize
         self.transforms_forward = transforms.Compose([
-            transforms.RandomAffine(
-                degrees=(-15, 15),  # Rotation between -15 to +15 degrees
-                translate=(0.10, 0.10),  # Translation up to 10% horizontally and vertically
-                scale=(0.90, 1.10),  # Scaling between 90% to 110%
-                fill=0xFFFFFF,
-                interpolation=BILINEAR  # Use bilinear interpolation
-            ),
-            transforms.ColorJitter(
-                brightness=0.10, # ±10% brightness
-                contrast=0.10, # ±10% contrast
-                saturation=0.10, # ±10% saturation
-                hue=0.10 # ±10% hue
-            ),
+            # transforms.RandomAffine(
+            #     degrees=(-45, 45),  # Rotation between -15 to +15 degrees
+            #     translate=(0.50, 0.50),  # Translation up to 10% horizontally and vertically
+            #     scale=(0.50, 1.50),  # Scaling between 90% to 110%
+            #     fill=0xFFFFFF,
+            #     interpolation=BILINEAR  # Use bilinear interpolation
+            # ),
+            # transforms.ColorJitter(
+            #     brightness=0.25, # ±10% brightness
+            #     contrast=0.25, # ±10% contrast
+            #     saturation=0.25, # ±10% saturation
+            #     hue=0.25 # ±10% hue
+            # ),
             transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
             transforms.Resize(256, interpolation=BILINEAR),
             transforms.RandomCrop(256),
             transforms.ToTensor(),
@@ -193,6 +232,9 @@ class DDPM(Diffuser):
         ω = torch.linspace(math.log(1.0), math.log(10000.0), self.s_channels // 2)
         ω = torch.exp(ω)
 
+        # mapping from timestep to percentage of maximum time
+        u = torch.linspace(0.00, 1.00, self.resolution).unsqueeze(1)
+
         # Precomputed sinusoidal spatial embedding
         sin = torch.sin(u * ω)  # (u * ω) is in radians
         cos = torch.cos(u * ω)  # (u * ω) is in radians
@@ -207,37 +249,109 @@ class DDPM(Diffuser):
     # ------------------------------------------------------------------------------------------
     # ------------------------ FORWARD :: The Forward Diffusion Process ------------------------
     # ------------------------------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward(self, x: torch.Tensor, t: int = 0) -> tuple[torch.Tensor, ...]:
 
-        ã̄ₜ = self.ã̄[self.timesteps] # signal-to-noise
-        b̃̄ₜ = self.ã̄[self.timesteps] # noise-to-signal
+        # start training on just the first few timestep
+        t = t or random.randint(1, 100)
 
-        # the first noise prediction as well as the noise injection
-        eₜ = torch.randn_like(x)
+        ã̄ₜ = self.ã̄[t].float() # signal-to-noise
+        b̃̄ₜ = self.b̃̄[t].float() # noise-to-signal
 
-        # the noisy image
+        # the true noise
+        eₜ = torch.randn_like(x).to(self.device).float()
+
+        # math
         xₜ = (x * ã̄ₜ) + (eₜ * b̃̄ₜ)
 
-        return x, xₜ, eₜ
+        # the temporal and spatial embeddings
+        t = self.t[t]
+        s = self.s
+
+        return xₜ, eₜ, t, s
 
     # ------------------------------------------------------------------------------------------
     # ------------------------ REVERSE :: The Reverse Diffusion Process ------------------------
     # ------------------------------------------------------------------------------------------
-    def reverse(self, x0: torch.Tensor, xₜ: torch.Tensor, eₜ: torch.Tensor) -> torch.Tensor:
+    def reverse(self, n: int = 5, t: int = 0) -> torch.Tensor:
 
-        # skip t = timesteps due to a quirk in the unet simulation logic
-        for t in reversed(range(1, self.timesteps)):
+        xₜ = self.transforms_forward(Image.open(random.choice(self.paths))).to(self.device)
+        self.transforms_reverse(xₜ).save(f'Outputs/before.png')
+        xₜ, _, _, _ = self.forward(xₜ, t=100)
+        self.transforms_reverse(xₜ).save(f'Outputs/after.png')
 
-            ã̄ = self.ã̄[t]
-            ã = self.ã[t]
-            b = self.b[t]
-            b̃̄ = self.b̃̄[t]
+        xₜ = xₜ.unsqueeze(0)
 
-            xₜ = (1 / ã) * (xₜ - (eₜ * (b / b̃̄))) # the denoised image
+        self.unet.eval()
 
-            # simulate noise prediction by deriving it directly from the clean image
-            eₜ = (xₜ - (x0 * ã̄)) / b̃̄
+        with torch.no_grad():
 
-            self.transforms_reverse(xₜ).save(f"Outputs/{t}_reversed.png")
+            # skip t = timesteps due to a quirk in the unet simulation logic
+            for t in reversed(range(1, 101)):
+
+                time  = self.t[t].unsqueeze(0)
+                space = self.s.unsqueeze(0)
+
+                eₜ = self.unet(xₜ, time, space)
+
+                ãₜ = self.ã[t].float()
+                b̃ₜ = self.b̃[t].float()
+
+                xₜ = (xₜ - (eₜ * b̃ₜ)) / ãₜ
+
+                self.transforms_reverse(xₜ[0]).save(f'Outputs/reverse_{t}.png')
+
+        self.unet.train()
 
         return xₜ
+
+
+    # ------------------------------------------------------------------------------------------
+    # ------------------------------- METHOD :: Learn from Error -------------------------------
+    # ------------------------------------------------------------------------------------------
+    def learn(self, error: torch.Tensor) -> None:
+
+        error.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+
+
+    # ------------------------------------------------------------------------------------------
+    # --------------------------------- METHOD :: Sanity Check ---------------------------------
+    # ------------------------------------------------------------------------------------------
+    def test(self, t: int = 0) -> torch.Tensor:
+
+        xₜ = self.transforms_forward(Image.open('Dataset/Pkmn_img1.JPG')).to(self.device)
+        xₜ = xₜ.float()
+
+        epsilons = []
+        forwards = []
+        reverses = []
+
+        for t in range(1, self.timesteps):
+
+            forwards.append(xₜ)
+
+            eₜ = torch.randn_like(xₜ).float()
+
+            ãₜ = self.ã[t].float()
+            b̃ₜ = self.b̃[t].float()
+
+            xₜ = (ãₜ * xₜ) + (b̃ₜ * eₜ)
+
+            epsilons.append(eₜ)
+
+            self.transforms_reverse(xₜ).save(f'Outputs/forward_{t}.png')
+
+        for t in reversed(range(1, self.timesteps)):
+
+            eₜ = epsilons.pop()
+
+            ãₜ = self.ã[t].float()
+            b̃ₜ = self.b̃[t].float()
+
+            xₜ = (xₜ - (eₜ * b̃ₜ)) / ãₜ
+
+            reverses.append(xₜ)
+
+            self.transforms_reverse(xₜ).save(f'Outputs/reverse_{t}.png')
